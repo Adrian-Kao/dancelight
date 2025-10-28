@@ -1,0 +1,56 @@
+
+### 🧾 建議交接說明（可貼在 Notion / GitHub / Teams）
+
+#### 🧱 我已完成的部分
+
+* ✅ 建立 Excel → PDF → OCR → Embedding 流程
+* ✅ 可以自動從 `catalogs/` 讀取 Excel，匯出每個分頁的 OCR 文字
+* ✅ 向量化與索引（使用 `BAAI/bge-m3`）功能正常
+* ✅ Gradio 介面可以查詢、顯示結果
+* ✅ 程式支援快取（`catalog_index.pkl`）
+
+#### ⚠️ 目前輸出狀況
+
+* OCR 已可成功辨識，但結果仍包含雜訊（字體形變、分段錯誤、亂碼混入）
+* 條列化與符號清理有初步改善，但部分內容仍顯示不自然，如：
+
+  ```
+  💡 ee BURL 12/24W 🌈 6500/4000K 📐 發光角度 290度 ...
+  ```
+* Rerank 模型已停用（目前是純 RAG 模式），速度正常、邏輯穩定
+
+#### 📌 可繼續的方向
+
+1. **改善輸出文字清理**
+
+   * 可加入語言模型（GPT、Gemini、Claude）做語意潤飾或摘要
+   * 或微調 `_ocr_image()` 的正則處理（調整符號過濾規則）
+2. **優化顯示層（Gradio UI）**
+
+   * 將結果改為表格顯示（型號／功率／色溫／角度）
+   * 或新增「AI 整理摘要」按鈕（呼叫 LLM）
+3. **多語支援**（若有國際型錄）
+
+   * 可改用 `chi_tra+eng+jpn` 或 `chi_sim+eng`
+4. **評估改進 OCR 準確度**
+
+   * 提高 DPI（例如 600）或使用 `--psm 4`（多欄識別）
+
+#### 🧰 環境設定
+
+* Windows（需安裝 Excel + Tesseract OCR）
+* Python 3.10+
+* 必裝套件：
+
+  ```
+  pip install -U gradio sentence-transformers numpy pillow pytesseract pywin32 pymupdf
+  ```
+* Tesseract 路徑：
+
+  ```
+  C:\Program Files\Tesseract-OCR\tesseract.exe
+  ```
+
+---
+
+是否要我幫你產出一份 Markdown 版的 `handover.md`（交接文件），裡面直接整理成可以丟到 Notion 或 GitHub 的格式？
