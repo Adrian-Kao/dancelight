@@ -1,0 +1,290 @@
+以下是這份 **Lighting Catalog — Excel (COM→PDF→OCR)** 專案的完整 `README.md` 範本，包含用途、架構、安裝、執行流程與疑難排解。
+你可以直接放在專案根目錄使用。
+
+---
+
+# 💡 Lighting Catalog — Excel (COM→PDF→OCR + BAAI Embedding Search)
+
+這個專案可將 **含圖片的 Excel 型錄檔** 自動轉換為可搜尋的文字索引。
+透過 **Excel COM → PDF → Tesseract OCR → 向量嵌入** 的流程，實現全文檢索與問答。
+主要用途是：自動化處理設計圖、照明目錄或產品圖鑑，將圖片文字化，並可透過 Gradio 介面搜尋。
+
+---
+
+## 🧩 系統架構
+
+```
+Excel (圖片+文字)
+        ↓
+Excel COM 自動化（win32com）
+        ↓
+PDF（每分頁輸出）
+        ↓
+Tesseract OCR (chi_tra + eng)
+        ↓
+純文字內容
+        ↓
+BAAI/bge-m3 嵌入向量
+        ↓
+Gradio 查詢介面（含 rerank 顯示）
+```
+
+---
+
+## ⚙️ 環境需求
+
+### 1. 系統環境
+
+* Windows 10 或 11
+* 安裝 **Microsoft Excel**（用於 COM 自動化轉檔）
+* 安裝 **Tesseract OCR**：
+
+  * 下載：[https://github.com/UB-Mannheim/tesseract/wiki](https://github.com/UB-Mannheim/tesseract/wiki)
+  * 安裝路徑建議：
+
+    ```
+    C:\Program Files\Tesseract-OCR\
+    ```
+  * 確認內含語言包：
+
+    ```
+    chi_tra.traineddata
+    eng.traineddata
+    ```
+
+    位於：`C:\Program Files\Tesseract-OCR\tessdata\`
+
+---
+
+### 2. Python 版本
+
+* Python 3.10 或以上
+* 建議使用虛擬環境：
+
+  ```bash
+  python -m venv venv
+  venv\Scripts\activate
+  ```
+
+---
+
+### 3. 套件安裝
+
+```bash
+pip install -U gradio sentence-transformers numpy pillow pytesseract pywin32 pymupdf
+```
+
+若出現 `tesseract: command not found`：
+請確認以下檔案存在：
+
+```
+C:\Program Files\Tesseract-OCR\tesseract.exe
+```
+
+並重新執行程式，會自動設定環境變數。
+
+---
+
+## 📁 資料夾結構
+
+```
+LightingCatalog/
+│
+├─ app.py                 ← 主程式（Gradio 介面）
+├─ catalogs/              ← 放 Excel 原始資料（每本型錄一份）
+├─ debug_out/             ← 產生的中間檔（PDF / PNG / OCR文字）
+├─ catalog_index.pkl      ← 建立後的索引快取
+└─ README.md
+```
+
+> 📌 注意：
+>
+> * Excel 檔案請放在 `catalogs/` 裡。
+> * 請先關閉 Excel 視窗，避免「~$」暫存檔鎖定。
+> * Excel 檔名可含中文，程式會自動轉成短路徑（8.3 格式）。
+
+---
+
+## 🚀 執行方式
+
+1. 啟動應用程式：
+
+   ```bash
+   python app.py
+   ```
+2. 開啟瀏覽器（預設）：
+
+   ```
+   http://127.0.0.1:7860
+   ```
+
+---
+
+## 🖥️ 使用說明
+
+### 步驟一：檢查環境
+
+點擊介面上的 **「🔧 環境檢查」**：
+
+* 會測試：
+
+  * Tesseract OCR 是否可運作
+  * 是否偵測到 Excel 檔案
+  * 是否能成功匯出分頁 PDF
+
+### 步驟二：建立索引
+
+點擊 **「① 掃描 Excel 並建立索引」**
+
+* 系統會逐一：
+
+  1. 開啟每個 Excel → 匯出 PDF
+  2. 對 PDF 做 OCR 文字辨識
+  3. 將每分頁內容斷詞、嵌入向量
+  4. 儲存索引快取 `catalog_index.pkl`
+
+建立完成後，會顯示：
+
+```
+✅ 索引完成：共 n 片段
+💾 已儲存索引（catalog_index.pkl）
+```
+
+### 步驟三：搜尋
+
+在下方「🔎 查詢」欄輸入關鍵字，例如：
+
+```
+崁燈 12W 3000K CRI90
+```
+
+結果會以條列形式顯示各分頁文字摘要：
+
+```
+### 商空軌道系統
+• 高顯指CRI90 崁燈系列
+• 12W 3000K 暖白光
+• 鋁合金燈體，壓鑄成型
+```
+
+---
+
+## 💾 快取管理
+
+* **🔄 載入快取**：載入前次索引（不需重新 OCR）
+* **🧹 清除快取**：刪除 `catalog_index.pkl`
+* **快取路徑**：`./catalog_index.pkl`
+
+---
+
+## 🧪 Debug 與檢查
+
+若出現「⚠️ 沒有成功讀取任何文字」：
+
+1. 打開 `debug_out/` 查看：
+
+   * 是否有 PDF 生成？
+   * PDF 內容是否可見圖片？
+2. 若 PDF 正常但文字仍為空：
+
+   * 可能是 Tesseract 缺字型（請確認 `chi_tra.traineddata`）
+   * 或圖像太模糊，可提高 `PAGE_DPI`（預設 500）
+
+---
+
+## 🧰 常見錯誤對應
+
+| 錯誤訊息                                            | 原因與解法                         |
+| ----------------------------------------------- | ----------------------------- |
+| `PermissionError: [Errno 13] Permission denied` | Excel 檔案仍開啟中，請先關閉             |
+| `ValueError: too many values to unpack`         | 舊版 `_ocr_pdf_file`，已修正        |
+| `com_error: 文件未儲存`                              | 加入 SaveAs() 已修正；若仍出現，請確保有權限存取 |
+| `wmf image format is not supported`             | openpyxl 嘗試解析圖片失敗，已改用 COM 自動化 |
+| OCR 字數 0                                        | Tesseract 語言包未安裝或圖片太淡         |
+| COM 斷線                                          | 由外部防毒或同步盤干擾，請移動到本機資料夾再試       |
+
+---
+
+## ⚡ 提示與建議
+
+* 若 Excel 為橫向頁面，可改：
+
+  ```python
+  tmp_ws.PageSetup.Orientation = 2  # 2 橫向
+  ```
+
+  若直向資料較多，改為：
+
+  ```python
+  tmp_ws.PageSetup.Orientation = 1  # 1 直向
+  ```
+
+* 若圖片過小，可調整輸出 DPI：
+
+  ```python
+  PAGE_DPI = 600
+  ```
+
+* 若想限制處理分頁：
+
+  ```python
+  sheet_names = [s for s in sheet_names if "居家" in s]
+  ```
+
+---
+
+## 🔍 模型資訊
+
+| 模型                       | 用途              | 來源                    |
+| ------------------------ | --------------- | --------------------- |
+| `BAAI/bge-m3`            | 向量嵌入（Embedding） | Sentence Transformers |
+| `BAAI/bge-reranker-base` | Rerank 最終排序     | CrossEncoder          |
+
+---
+
+## 🧾 專案摘要
+
+| 模組                                 | 功能                    |
+| ---------------------------------- | --------------------- |
+| `export_workbook_sheets_to_text()` | Excel → PDF → OCR 主邏輯 |
+| `_ocr_pdf_file()`                  | 將 PDF 每頁轉圖片後文字化       |
+| `InMemoryIndex`                    | 向量索引管理                |
+| `ask()`                            | 搜尋並列出最相關分頁            |
+| `run_diagnostics()`                | 測試環境與匯出流程             |
+| `gradio`                           | 前端互動介面                |
+
+---
+
+## ✅ 範例執行畫面
+
+（執行後瀏覽器開啟）
+
+```
+http://127.0.0.1:7860
+```
+
+主介面按鈕：
+
+* 🔧 環境檢查
+* ① 掃描 Excel 並建立索引
+* 🔄 載入快取
+* 🧹 清除快取
+
+輸入查詢：
+
+```
+嵌燈 12W CRI90
+```
+
+輸出結果：
+
+```
+### 居家照明
+• 嵌燈系列 12W
+• 高顯色 CRI90
+• 3000K 暖白光
+```
+
+---
+
+
