@@ -1,378 +1,501 @@
-# app.py — Lighting Catalog RAG (OCR + Folder Auto-Load + Cache)
-# 依賴：pip install -U gradio pdfplumber sentence-transformers scikit-learn numpy pandas pillow pymupdf pytesseract
-# 啟動前先開變數:venv\Scripts\activate
-import os, io, re, pickle, logging, warnings
+# =============================================
+# Lighting Catalog — Excel (COM→PDF→OCR) Ultimate
+# =============================================
+
+import os, io, re, time, ctypes, pickle, tempfile, shutil, warnings, logging
 from typing import List, Dict, Any, Tuple
-
 import numpy as np
-import pandas as pd
-from PIL import Image, ImageOps, ImageFilter
-
 import gradio as gr
-import pdfplumber
-import fitz  # PyMuPDF
 import pytesseract
+from PIL import Image, ImageOps, ImageFilter, ImageDraw
+import fitz  # PyMuPDF
 from sentence_transformers import SentenceTransformer, CrossEncoder
 
-# ---- 靜音一些不是錯誤的噪音訊息 ----
+# -------------------- 基本設定 --------------------
+EMBED_MODEL_NAME = "BAAI/bge-m3"
+RERANK_MODEL_NAME = "BAAI/bge-reranker-base"
+USE_RERANK = True
+
+DEFAULT_OCR_LANG = "chi_tra+eng"
+CACHE_PATH = "catalog_index.pkl"
+CATALOG_DIR = "catalogs"
+
+# OCR/渲染設定
+PAGE_DPI = 500               # 較高 DPI，提升 OCR
+DEBUG_SAVE = True            # 匯出中間 PDF/PNG 供檢查
+DEBUG_DIR  = "debug_out"
+
+os.makedirs(DEBUG_DIR, exist_ok=True)
+warnings.filterwarnings("ignore")
 logging.getLogger("pdfminer").setLevel(logging.ERROR)
-warnings.filterwarnings("ignore", module="fitz")
 
-# =========================
-# 基本設定（可自行調整）
-# =========================
-EMBED_MODEL_NAME = "BAAI/bge-m3"                 # 多語向量模型
-RERANK_MODEL_NAME = "BAAI/bge-reranker-base"     # 交叉編碼 rerank
-USE_RERANK = True                                # 初期為 True；若要更快可改 False
-
-DEFAULT_OCR_LANG = "chi_tra+eng"                 # Tesseract 語言
-CHUNK_MAX_CHARS = 800
-CHUNK_OVERLAP = 100
-CACHE_PATH = "catalog_index.pkl"                 # 快取檔名（放在專案根目錄）
-
-# =========================
-# 嘗試自動設定 Tesseract 路徑（Windows 常見安裝路徑）
-# =========================
+# -------------------- Tesseract 路徑 --------------------
 def _maybe_set_tesseract_path():
     candidates = [
         r"C:\Program Files\Tesseract-OCR\tesseract.exe",
         r"C:\Tesseract-OCR\tesseract.exe",
     ]
-    for path in candidates:
-        if os.path.exists(path):
-            pytesseract.pytesseract.tesseract_cmd = path
-            tessdata_dir = os.path.join(os.path.dirname(path), "tessdata")
-            if os.path.isdir(tessdata_dir):
-                os.environ["TESSDATA_PREFIX"] = tessdata_dir
+    found = False
+    for p in candidates:
+        if os.path.exists(p):
+            pytesseract.pytesseract.tesseract_cmd = p
+            td = os.path.join(os.path.dirname(p), "tessdata")
+            if os.path.isdir(td):
+                os.environ["TESSDATA_PREFIX"] = td
+            print(f"✅ Tesseract: {p}")
+            found = True
             break
+    if not found:
+        fixed = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+        if os.path.exists(fixed):
+            pytesseract.pytesseract.tesseract_cmd = fixed
+            os.environ["TESSDATA_PREFIX"] = r"C:\Program Files\Tesseract-OCR\tessdata"
+            print("✅ 使用固定路徑設定 Tesseract。")
+        else:
+            print("⚠️ 未找到 Tesseract，請確認是否已安裝。")
+
 _maybe_set_tesseract_path()
 
-# =========================
-# 嵌入與 rerank
-# =========================
+# -------------------- 模型 --------------------
 embed_model = SentenceTransformer(EMBED_MODEL_NAME)
-reranker = CrossEncoder(RERANK_MODEL_NAME) if USE_RERANK else None
+reranker    = CrossEncoder(RERANK_MODEL_NAME) if USE_RERANK else None
 
-def embed_passages(texts: List[str]) -> np.ndarray:
-    return embed_model.encode(texts, convert_to_numpy=True, normalize_embeddings=True, batch_size=64)
+def embed_passages(texts): return embed_model.encode(texts, convert_to_numpy=True, normalize_embeddings=True, batch_size=64)
+def embed_query(q):        return embed_model.encode([q], convert_to_numpy=True, normalize_embeddings=True)[0]
 
-def embed_query(q: str) -> np.ndarray:
-    return embed_model.encode([q], convert_to_numpy=True, normalize_embeddings=True)[0]
+# -------------------- OCR 工具 --------------------
+def _ocr_image(img: Image.Image, lang=DEFAULT_OCR_LANG) -> str:
+    g = ImageOps.grayscale(img)
+    g = ImageOps.autocontrast(g)
+    g = g.filter(ImageFilter.MedianFilter(3))
+    txt = pytesseract.image_to_string(g, lang=lang, config="--psm 6 --oem 3")
+    txt = re.sub(r"[ \t]+", " ", txt)
+    return re.sub(r"\n{2,}", "\n", txt).strip()
 
-# =========================
-# 查詢同義詞正規化（可自行擴充）
-# =========================
-SYNONYMS = {
-    "暖白": "3000K", "黃光": "3000K",
-    "自然光": "4000K", "白光": "5000K",
-    "流明": "lm", "亮度": "lm", "功率": "W", "瓦數": "W",
-    "防水": "IP", "顯色": "CRI", "顯色指數": "CRI",
-    "角度": "beam", "光束角": "beam",
-    "軌道燈": "track light", "投光燈": "flood light",
-    "崁燈": "downlight", "投射燈": "flood light"
-}
-def normalize_query(q: str) -> str:
-    out = q
-    for k, v in SYNONYMS.items():
-        out = out.replace(k, v)
-    return out
-
-# =========================
-# OCR 與抽取（含強制 OCR、提高 DPI 與 Tesseract config）
-# =========================
-def _visible_char_count(s: str) -> int:
-    return len(re.findall(r"[A-Za-z0-9\u4e00-\u9fff]", s))
-
-def ocr_pdf_page(fitz_page, dpi: int = 400, lang: str = DEFAULT_OCR_LANG) -> str:
-    mat = fitz.Matrix(dpi/72.0, dpi/72.0)
-    pix = fitz_page.get_pixmap(matrix=mat, alpha=False)
-    img = Image.open(io.BytesIO(pix.tobytes("png")))
-    img = ImageOps.grayscale(img)
-    img = ImageOps.autocontrast(img)
-    img = img.filter(ImageFilter.MedianFilter(3))
-    config = "--psm 6 --oem 3"  # 適合段落/表格小字
-    text = pytesseract.image_to_string(img, lang=lang, config=config)
-    text = re.sub(r"[ \t]+", " ", text)
-    text = re.sub(r"\n{2,}", "\n", text).strip()
-    return text
-
-def extract_pdf_chunks(pdf_path: str,
-                       catalog_name: str,
-                       use_ocr_fallback: bool = True,
-                       ocr_lang: str = DEFAULT_OCR_LANG,
-                       force_ocr: bool = False,
-                       max_chars: int = CHUNK_MAX_CHARS,
-                       overlap: int = CHUNK_OVERLAP) -> List[Dict[str, Any]]:
-    chunks = []
+def _ocr_pdf_file(pdf_path: str, lang=DEFAULT_OCR_LANG) -> Tuple[str, list]:
+    """
+    固定回傳：(全文字串, 每頁字元數list)
+    並將中間 PNG 存到 debug_out，DPI 依 PAGE_DPI
+    """
+    parts, per_page = [], []
     try:
-        with pdfplumber.open(pdf_path) as pdf, fitz.open(pdf_path) as doc:
-            for i, page in enumerate(pdf.pages, start=1):
-                text = ""
-                # 非強制時先試文字層
-                if not force_ocr:
-                    try:
-                        text = page.extract_text() or ""
-                        text = re.sub(r"[ \t]+", " ", text)
-                        text = re.sub(r"\n{2,}", "\n", text).strip()
-                    except Exception:
-                        text = ""
+        with fitz.open(pdf_path) as doc:
+            for i, page in enumerate(doc, 1):
+                mat = fitz.Matrix(PAGE_DPI/72.0, PAGE_DPI/72.0)
+                pix = page.get_pixmap(matrix=mat, alpha=False)
+                png = pix.tobytes("png")
+                if DEBUG_SAVE:
+                    out_png = os.path.join(DEBUG_DIR, f"{os.path.basename(pdf_path)}_p{i}.png")
+                    with open(out_png, "wb") as f:
+                        f.write(png)
+                img = Image.open(io.BytesIO(png)).convert("RGB")
+                txt = _ocr_image(img, lang=lang)
+                if not txt.strip():
+                    txt = _ocr_image(img, lang="eng")
+                parts.append(txt)
+                per_page.append(len(txt))
+    except Exception as e:
+        print(f"[OCR] 讀取 PDF 失敗：{type(e).__name__}: {e}")
+        return "", []
+    text = "\n".join([t for t in parts if t.strip()])
+    return text, per_page
 
-                need_ocr = force_ocr
-                if not force_ocr:
-                    if _visible_char_count(text) < 20 and use_ocr_fallback:
-                        need_ocr = True
+def _sanitize_filename(name: str) -> str:
+    name = re.sub(r'[\\/:*?"<>|]+', "_", name).strip().strip(".")
+    return name[:80] or "sheet"
 
-                if need_ocr:
-                    try:
-                        text = ocr_pdf_page(doc[i-1], dpi=400, lang=ocr_lang)
-                    except Exception:
-                        text = text  # 可能仍為空
-
-                if not text:
-                    continue
-
-                # 切塊
-                start = 0
-                while start < len(text):
-                    end = min(start + max_chars, len(text))
-                    piece = text[start:end]
-                    chunks.append({"catalog": catalog_name, "page": i, "text": piece})
-                    if end == len(text):
-                        break
-                    start = max(0, end - overlap)
+def _short_path(p: str) -> str:
+    try:
+        GetShortPathNameW = ctypes.windll.kernel32.GetShortPathNameW
+        GetShortPathNameW.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint]
+        buf = ctypes.create_unicode_buffer(1024)
+        res = GetShortPathNameW(p, buf, 1024)
+        return buf.value if res else p
     except Exception:
-        return []
-    return chunks
+        return p
 
-# =========================
-# In-memory 索引
-# =========================
+# -------------------- COM 渲染（每分頁獨立 Excel 行程） --------------------
+def export_workbook_sheets_to_text(xlsx_path: str, lang=DEFAULT_OCR_LANG) -> Dict[str, str]:
+    """
+    Excel COM（超強健版）
+    - 先把原檔複製到純 ASCII 的暫存資料夾 root/src.xlsx
+    - 先用一次性 Excel 行程列出所有分頁名稱
+    - 每個分頁各自啟動獨立 Excel 行程：
+        sheet.Copy() → 新活頁簿 → SaveAs(.xlsx，失敗退 .xls) → ExportAsFixedFormat(PDF)
+    - 全程使用 8.3 短路徑；PDF 複製到 debug_out/ 後做 OCR
+    """
+    texts: Dict[str, str] = {}
+    try:
+        import win32com.client, pythoncom
+    except Exception:
+        print("[COM] pywin32 未安裝或非 Windows。")
+        return texts
+
+    # 建立純 ASCII 的工作資料夾
+    root = tempfile.mkdtemp(prefix="xls2pdf_job_")
+    ascii_root = _short_path(root)
+    src_copy = os.path.join(ascii_root, "src.xlsx")
+    try:
+        shutil.copy2(xlsx_path, src_copy)
+    except Exception as e:
+        print(f"[COM] 複製檔案失敗：{e}")
+        shutil.rmtree(root, ignore_errors=True)
+        return texts
+
+    # --- 先列出分頁名稱（單次行程） ---
+    def list_sheet_names(src_copy_ascii: str) -> List[str]:
+        names = []
+        pythoncom.CoInitialize()
+        excel = None
+        try:
+            excel = win32com.client.DispatchEx("Excel.Application")
+            excel.Visible = False; excel.DisplayAlerts = False
+            try: excel.AutomationSecurity = 1
+            except Exception: pass
+            wb = excel.Workbooks.Open(_short_path(os.path.abspath(src_copy_ascii)), ReadOnly=True)
+            for s in wb.Sheets:
+                names.append(str(s.Name))
+            wb.Close(SaveChanges=False); excel.Quit(); time.sleep(0.2)
+        except Exception as e:
+            print(f"[COM] 讀取分頁名稱失敗：{type(e).__name__}: {e}")
+            try:
+                if excel: excel.Quit()
+            except Exception:
+                pass
+        finally:
+            pythoncom.CoUninitialize()
+        return names
+
+    sheet_names = list_sheet_names(src_copy)
+    if not sheet_names:
+        print("[COM] 找不到任何分頁或讀取分頁名稱失敗。")
+        shutil.rmtree(root, ignore_errors=True)
+        return texts
+
+    # --- 每分頁獨立處理 ---
+    def process_one_sheet(src_copy_ascii: str, sheet_name: str) -> str:
+        pythoncom.CoInitialize()
+        text = ""
+        excel = None
+        work_root = tempfile.mkdtemp(prefix="xls2pdf_sheet_")
+        ascii_wr = _short_path(work_root)
+
+        tmp_xlsx = os.path.join(ascii_wr, "only_sheet.xlsx")
+        tmp_xls  = os.path.join(ascii_wr, "only_sheet.xls")
+        tmp_pdf  = os.path.join(ascii_wr, "only_sheet.pdf")
+
+        safe = _sanitize_filename(sheet_name)
+        out_pdf = os.path.join(DEBUG_DIR, f"{safe}.pdf")
+
+        for p in (tmp_xlsx, tmp_xls, tmp_pdf, out_pdf):
+            try:
+                if os.path.exists(p): os.remove(p)
+            except Exception:
+                pass
+
+        try:
+            excel = win32com.client.DispatchEx("Excel.Application")
+            excel.Visible = False; excel.DisplayAlerts = False
+            try: excel.AutomationSecurity = 1
+            except Exception: pass
+
+            wb = excel.Workbooks.Open(_short_path(os.path.abspath(src_copy_ascii)), ReadOnly=True)
+
+            target = None
+            for s in wb.Sheets:
+                if str(s.Name) == sheet_name:
+                    target = s; break
+            if target is None:
+                wb.Close(SaveChanges=False); excel.Quit(); pythoncom.CoUninitialize()
+                shutil.rmtree(work_root, ignore_errors=True)
+                return ""
+
+            target.Copy()
+            time.sleep(0.2)
+            tmp_wb = excel.ActiveWorkbook
+            if tmp_wb is None:
+                time.sleep(0.5)
+                tmp_wb = excel.ActiveWorkbook
+            if tmp_wb is None:
+                wb.Close(SaveChanges=False); excel.Quit(); pythoncom.CoUninitialize()
+                shutil.rmtree(work_root, ignore_errors=True)
+                return ""
+
+            tmp_ws = tmp_wb.Sheets(1)
+            try:
+                tmp_ws.PageSetup.PrintArea = ""
+                tmp_ws.PageSetup.Zoom = False
+                tmp_ws.PageSetup.FitToPagesWide = 1
+                tmp_ws.PageSetup.FitToPagesTall = False
+                tmp_ws.PageSetup.Orientation = 2  # 2=Landscape(橫向). 如需直向改 1
+            except Exception:
+                pass
+
+            # 先存檔再匯出 PDF（避免「文件未儲存」）
+            saved = False
+            for attempt in range(2):
+                try:
+                    if attempt == 0:
+                        tmp_wb.SaveAs(_short_path(tmp_xlsx), FileFormat=51)  # .xlsx
+                    else:
+                        tmp_wb.SaveAs(_short_path(tmp_xls),  FileFormat=56)  # .xls
+                    saved = True; break
+                except Exception as e:
+                    print(f"[COM] SaveAs 失敗（{sheet_name}，attempt={attempt}）：{e}")
+                    time.sleep(0.3)
+
+            if not saved:
+                try: tmp_wb.Close(SaveChanges=False)
+                except Exception: pass
+                wb.Close(SaveChanges=False); excel.Quit(); pythoncom.CoUninitialize()
+                shutil.rmtree(work_root, ignore_errors=True)
+                return ""
+
+            # 匯出 PDF（短路徑）
+            exported = False
+            for attempt in range(2):
+                try:
+                    tmp_wb.ExportAsFixedFormat(0, _short_path(tmp_pdf))
+                    exported = os.path.exists(tmp_pdf)
+                    if exported: break
+                except Exception as e:
+                    print(f"[COM] Export PDF 失敗（{sheet_name}，attempt={attempt}）：{e}")
+                    time.sleep(0.3)
+
+            try: tmp_wb.Close(SaveChanges=False)
+            except Exception: pass
+            try: wb.Close(SaveChanges=False)
+            except Exception: pass
+            try: excel.Quit()
+            except Exception: pass
+            pythoncom.CoUninitialize()
+
+            if exported:
+                try: shutil.copy2(tmp_pdf, out_pdf)
+                except Exception: out_pdf = tmp_pdf
+
+                ocr_res = _ocr_pdf_file(out_pdf, lang=lang)
+                if isinstance(ocr_res, tuple):
+                    text = ocr_res[0] if len(ocr_res) >= 1 else ""
+                    per_page = ocr_res[1] if len(ocr_res) >= 2 else []
+                else:
+                    text = ocr_res; per_page = []
+                print(f"[OCR] {sheet_name} → 頁數:{len(per_page)}；每頁字元:{per_page}")
+
+        except Exception as e:
+            print(f"[COM] 單分頁處理失敗（{sheet_name}）：{type(e).__name__}: {e}")
+            try:
+                if excel: excel.Quit()
+            except Exception:
+                pass
+            pythoncom.CoUninitialize()
+        finally:
+            shutil.rmtree(work_root, ignore_errors=True)
+
+        return text
+
+    for name in sheet_names:
+        txt = process_one_sheet(src_copy, name)
+        if txt.strip():
+            texts[name] = txt
+
+    shutil.rmtree(root, ignore_errors=True)
+    return texts
+
+# -------------------- 索引 --------------------
 class InMemoryIndex:
     def __init__(self):
         self.docs: List[Dict[str, Any]] = []
-        self.embs: np.ndarray | None = None
+        self.embs = None
         self.built = False
 
-    def reset(self):
-        self.docs, self.embs, self.built = [], None, False
-
-    def add_docs(self, docs: List[Dict[str, Any]]):
-        self.docs.extend(docs)
+    def reset(self): self.docs, self.embs, self.built = [], None, False
+    def add_docs(self, docs): self.docs.extend(docs)
 
     def build(self):
-        if not self.docs:
-            self.embs, self.built = None, False
-            return "沒有可建立索引的文件"
-        texts = [d["text"] for d in self.docs]
-        self.embs = embed_passages(texts)
+        if not self.docs: return "⚠️ 沒有內容可建立索引"
+        self.embs = embed_passages([d["text"] for d in self.docs])
         self.built = True
-        return f"索引建立完成，共 {len(self.docs)} 個片段"
+        return f"✅ 索引完成：{len(self.docs)} 片段"
 
-    def search(self, query: str, top_k: int = 8) -> List[Tuple[int, float]]:
-        if not self.built or self.embs is None:
-            return []
-        q = normalize_query(query)
+    def search(self, q: str, k: int = 6):
+        if not self.built or self.embs is None: return []
         q_emb = embed_query(q)
-        sims = (self.embs @ q_emb)
-
-        k = min(max(top_k * 5, top_k), len(sims))
-        cand_idx = np.argpartition(-sims, range(k))[:k]
-        pairs = [(int(i), float(sims[i])) for i in cand_idx]
-        pairs.sort(key=lambda x: x[1], reverse=True)
-        pairs = pairs[:max(top_k, 1)]
-
-        if USE_RERANK and reranker is not None and len(pairs) > 0:
-            q_dup = [q] * len(pairs)
-            cand_texts = [self.docs[i]["text"] for i, _ in pairs]
-            scores = reranker.predict(list(zip(q_dup, cand_texts)))
-            reranked = list(zip([p[0] for p in pairs], scores))
-            reranked.sort(key=lambda x: x[1], reverse=True)
-            pairs = reranked[:top_k]
+        sims = self.embs @ q_emb
+        idx = np.argsort(-sims)[:k]
+        pairs = [(int(i), float(sims[int(i)])) for i in idx]
+        if USE_RERANK and reranker:
+            cand = [self.docs[i]["text"] for i, _ in pairs]
+            scores = reranker.predict(list(zip([q]*len(cand), cand)))
+            pairs = sorted(zip([p[0] for p in pairs], scores), key=lambda x: x[1], reverse=True)
         return pairs
 
 INDEX = InMemoryIndex()
 
-# =========================
-# 快取：儲存 / 載入 / 清除
-# =========================
-def save_cache(index: InMemoryIndex) -> str:
-    with open(CACHE_PATH, "wb") as f:
-        pickle.dump(index, f)
-    return f"💾 索引已儲存至 {os.path.abspath(CACHE_PATH)}"
+# -------------------- 快取 --------------------
+def save_cache(index):
+    with open(CACHE_PATH, "wb") as f: pickle.dump(index, f)
+    return f"💾 已儲存索引（{len(index.docs)} 片段）"
 
-def load_cache() -> str:
+def load_cache():
     global INDEX
-    if not os.path.exists(CACHE_PATH):
-        return "⚠️ 找不到快取檔，請先建立索引。"
-    with open(CACHE_PATH, "rb") as f:
-        INDEX = pickle.load(f)
-    return f"✅ 已載入快取，可直接查詢（片段：{len(INDEX.docs)}）"
+    if not os.path.exists(CACHE_PATH): return "⚠️ 沒有快取檔"
+    with open(CACHE_PATH, "rb") as f: INDEX = pickle.load(f)
+    return f"✅ 已載入快取（{len(INDEX.docs)} 片段）"
 
-def clear_cache() -> str:
+def clear_cache():
     if os.path.exists(CACHE_PATH):
-        os.remove(CACHE_PATH)
-        return "🧹 已刪除快取檔 catalog_index.pkl"
-    return "ℹ️ 沒有可刪除的快取檔"
+        os.remove(CACHE_PATH); return "🧹 已刪除快取"
+    return "ℹ️ 沒有快取可刪除"
 
-# =========================
-# 建索引（支援實時進度回報）
-# =========================
-def list_catalog_pdfs() -> str:
-    cwd = os.getcwd()
-    folder = os.path.join(cwd, "catalogs")
-    if not os.path.isdir(folder):
-        return f"⚠️ 找不到資料夾：{folder}"
+# -------------------- 建索引（COM-only） --------------------
+def list_excels() -> str:
+    folder = os.path.join(os.getcwd(), CATALOG_DIR)
+    if not os.path.isdir(folder): return f"⚠️ 找不到資料夾：{folder}"
     files = []
-    for root, _, fs in os.walk(folder):
-        for f in fs:
-            if f.lower().endswith(".pdf"):
-                files.append(os.path.join(root, f))
-    if not files:
-        return f"⚠️ {folder} 內沒有 .pdf 檔案"
-    out = [f"🔎 目前工作路徑：{cwd}", f"📃 找到 {len(files)} 本 PDF："]
-    out += [" - " + p for p in files]
-    return "\n".join(out)
+    for f in os.listdir(folder):
+        fl = f.lower()
+        if not fl.endswith((".xlsx", ".xlsm")): continue
+        if f.startswith("~$"): continue  # 跳過 Excel 鎖檔
+        files.append(f)
+    if not files: return f"⚠️ {folder} 內沒有 Excel 檔"
+    return "📊 將處理下列檔案：\n" + "\n".join(f" - {x}" for x in files)
 
-def build_index_from_folder(ocr_lang: str, use_ocr: bool, force_ocr: bool, progress=gr.Progress(track_tqdm=True)):
+def build_index_from_excel(ocr_lang: str, progress=gr.Progress(track_tqdm=True)):
     try:
         INDEX.reset()
-        cwd = os.getcwd()
-        folder = os.path.join(cwd, "catalogs")
+        folder = os.path.join(os.getcwd(), CATALOG_DIR)
         if not os.path.isdir(folder):
-            yield f"⚠️ 找不到資料夾：{folder}\n請建立 catalogs/ 並放入 PDF。"
-            return
+            yield f"⚠️ 找不到 {folder}"; return
 
-        # 掃描 PDF
-        pdf_files = []
-        for root, _, files in os.walk(folder):
-            for f in files:
-                if f.lower().endswith(".pdf"):
-                    pdf_files.append(os.path.join(root, f))
-        if not pdf_files:
-            yield f"⚠️ 在 {folder} 沒找到任何 PDF。"
-            return
+        xlsx_files = []
+        for f in os.listdir(folder):
+            if f.startswith("~$"):   # 跳過暫存鎖檔
+                continue
+            if f.lower().endswith((".xlsx", ".xlsm")):
+                xlsx_files.append(os.path.join(folder, f))
 
-        yield f"🔎 工作路徑：{cwd}\n📁 共 {len(pdf_files)} 本 PDF：\n" + "\n".join(" - "+p for p in pdf_files)
+        if not xlsx_files:
+            yield "⚠️ 未找到任何 Excel 檔"; return
 
-        total_chunks = 0
-        for fi, pdf_path in enumerate(pdf_files, 1):
-            base = os.path.basename(pdf_path)
-            yield f"📄 [{fi}/{len(pdf_files)}] 開始處理：{base}"
-            try:
-                with fitz.open(pdf_path) as _doc:
-                    if _doc.needs_pass:
-                        yield f"❌ 檔案加密需密碼：{pdf_path}"
-                        continue
-                    n_pages = len(_doc)
-
-                progress(0, desc=f"OCR/抽取 {base}...")
-                chunks = extract_pdf_chunks(
-                    pdf_path,
-                    catalog_name=os.path.splitext(base)[0],
-                    use_ocr_fallback=use_ocr,
-                    ocr_lang=ocr_lang,
-                    force_ocr=force_ocr
-                )
-                total_chunks += len(chunks)
-                INDEX.add_docs(chunks)
-                yield f"✅ {base} 加入片段：{len(chunks)}（頁數：{n_pages}）"
-            except Exception as e:
-                yield f"❌ 解析失敗 {base} → {type(e).__name__}: {e}"
+        for i, path in enumerate(xlsx_files, 1):
+            base = os.path.basename(path)
+            yield f"[{i}/{len(xlsx_files)}] 解析 {base} ..."
+            sheet_texts = export_workbook_sheets_to_text(path, lang=ocr_lang)
+            added = 0
+            for sheet_name, full_text in sheet_texts.items():
+                # 切塊
+                MAX = 800; OVER = 120
+                s = 0
+                while s < len(full_text):
+                    e = min(s + MAX, len(full_text))
+                    INDEX.add_docs([{"catalog": sheet_name, "text": full_text[s:e]}])
+                    added += 1
+                    if e == len(full_text): break
+                    s = max(0, e - OVER)
+            yield f"   ↳ 加入片段：{added}"
 
         if not INDEX.docs:
-            yield "⚠️ 沒有成功加入任何片段，請檢查 OCR 設定或勾『強制 OCR』再試。"
+            yield "⚠️ 沒有成功讀取任何文字。\n請確認：\n- Excel 可手動『另存 PDF』看到內容\n- Tesseract 安裝完整（包含 chi_tra 語言包）\n- debug_out/ 是否有 PDF 與 PNG（若沒有，表示 COM 未成功匯出）"
             return
 
-        build_msg = INDEX.build()
-        yield f"🎉 {build_msg}（總片段：{total_chunks}）"
-        # 成功後自動儲存快取
+        yield INDEX.build()
         yield save_cache(INDEX)
-
     except Exception as e:
-        yield f"💥 發生錯誤：{type(e).__name__}: {e}"
+        yield f"💥 錯誤：{type(e).__name__}: {e}"
 
-# =========================
-# 查詢
-# =========================
-def ask(query: str, top_k: int = 6) -> pd.DataFrame:
-    if not INDEX.built:
-        return pd.DataFrame([{"提示": "請先建立索引，或點『🔄 重新載入快取』"}])
-    hits = INDEX.search(query, top_k=top_k)
-    rows = []
-    for idx, score in hits:
+# -------------------- 查詢（Markdown 條列） --------------------
+def ask(query: str, top_k: int = 6) -> str:
+    if not INDEX.built: return "⚠️ 請先建立索引或載入快取。"
+    hits = INDEX.search(query, top_k)
+    if not hits: return "❌ 找不到相符內容。"
+
+    out = []
+    for idx, _ in hits:
         d = INDEX.docs[idx]
-        txt = d["text"].replace("\n", " ")
-        if len(txt) > 220:
-            txt = txt[:220] + "..."
-        rows.append({
-            "型錄": d["catalog"],
-            "頁碼": d["page"],
-            "相似度/分數": round(float(score), 4),
-            "片段摘要": txt
-        })
-    return pd.DataFrame(rows)
+        text = d["text"].strip()
+        # 簡易列點化（你可再加規格抽取）
+        lines = [x.strip(" ・-••") for x in re.split(r"[\n。•\-]", text) if len(x.strip()) > 2]
+        bullets = "\n".join(f"• {x}" for x in lines[:12])
+        out.append(f"### {d['catalog']}\n{bullets}")
+    return "\n\n".join(out)
 
-def sample_queries():
-    return (
-        "崁燈 12W 3000K CRI90 24度",
-        "戶外 IP65 投光燈 5000K 感應",
-        "展示櫃 downlight 15~24 度 不眩光"
-    )
+# -------------------- 環境檢查 --------------------
+def run_diagnostics(ocr_lang: str) -> str:
+    report = []
 
-# =========================
-# Gradio 介面
-# =========================
-with gr.Blocks(title="Lighting Catalog RAG – OCR + 自動載入 + 快取") as demo:
+    # 1) Tesseract smoke test
+    try:
+        img = Image.new("RGB", (800, 200), "white")
+        draw = ImageDraw.Draw(img)
+        draw.text((10, 20), "TEST 測試 123 CRI90 3000K IP65 24°", fill="black")
+        test_txt = _ocr_image(img, lang=ocr_lang) or _ocr_image(img, lang="eng")
+        report.append(f"🧪 Tesseract 測試字數：{len(test_txt)}（內容：{test_txt[:40]}...）")
+    except Exception as e:
+        report.append(f"🧪 Tesseract 測試失敗：{e}")
+
+    # 2) 列出 Excel
+    report.append(list_excels())
+
+    # 3) 挑第一個 Excel 的第一個分頁做 COM→PDF→OCR
+    folder = os.path.join(os.getcwd(), CATALOG_DIR)
+    files = [f for f in os.listdir(folder) if f.lower().endswith((".xlsx", ".xlsm")) and not f.startswith("~$")] if os.path.isdir(folder) else []
+    if not files:
+        report.append("⚠️ 沒有 Excel 可測。")
+        return "\n\n".join(report)
+
+    x_path = os.path.join(folder, files[0])
+    report.append(f"🔧 測試檔：{files[0]} （嘗試全部分頁，回報第一個成功分頁）")
+
+    sheet_texts = export_workbook_sheets_to_text(x_path, lang=ocr_lang)
+    if not sheet_texts:
+        report.append("❌ COM 匯出沒有任何分頁成功（請看 debug_out/ 是否有 PDF）。")
+        return "\n\n".join(report)
+
+    first_sheet = next(iter(sheet_texts.keys()))
+    text = sheet_texts[first_sheet]
+    report.append(f"✅ 分頁：{first_sheet}，全文字數：{len(text)}")
+    report.append(f"📂 請查看 debug_out/ 內的 PDF 與 PNG 是否符合畫面")
+
+    return "\n\n".join(report)
+
+# -------------------- UI --------------------
+with gr.Blocks(title="Lighting Catalog — Excel (COM→PDF→OCR) + Diagnostics") as demo:
     gr.Markdown(
-        "# 💡 Lighting Catalog RAG – OCR + 自動載入 + 快取\n"
-        "把 PDF 放在專案根目的 **catalogs/** → 按「掃描並建立索引」→ 查詢。\n"
-        "首次完成後會自動儲存索引到 `catalog_index.pkl`；下次啟動會自動載入。"
+        "# 💡 Lighting Catalog — Excel (COM→PDF→OCR)\n"
+        f"- Excel 檔放到 `./{CATALOG_DIR}/`（請關閉檔案避免 `~$` 鎖檔）\n"
+        "- 本版 **不使用 openpyxl**，只走 **Excel COM → PDF → OCR**，支援浮動圖形/WMF 等\n"
+        f"- 中間產物輸出到 `./{DEBUG_DIR}/`，可肉眼檢查\n"
+        "- 嵌入：BAAI/bge-m3，Rerank：BAAI/bge-reranker-base"
     )
 
     with gr.Row():
-        ocr_lang = gr.Dropdown(choices=["chi_tra+eng", "chi_sim+eng", "eng"], value=DEFAULT_OCR_LANG, label="OCR 語言（Tesseract）")
-        use_ocr = gr.Checkbox(value=True, label="需要時自動使用 OCR（處理圖片文字）")
-        force_ocr = gr.Checkbox(value=False, label="強制 OCR（每頁都 OCR）")
+        ocr_lang = gr.Dropdown(["chi_tra+eng", "chi_sim+eng", "eng"], value=DEFAULT_OCR_LANG, label="OCR 語言")
+        build_btn  = gr.Button("① 掃描 Excel 並建立索引", scale=3)
+        diag_btn   = gr.Button("🔧 環境檢查", scale=1)
+        reload_btn = gr.Button("🔄 載入快取", scale=1)
+        clear_btn  = gr.Button("🧹 清除快取", scale=1)
 
+    status = gr.Markdown("尚未建立")
+    build_btn.click(build_index_from_excel, inputs=[ocr_lang], outputs=[status])
+    diag_btn.click(run_diagnostics, inputs=[ocr_lang], outputs=[status])
+    reload_btn.click(load_cache, outputs=[status])
+    clear_btn.click(clear_cache, outputs=[status])
+
+    gr.Markdown("## 🔎 查詢")
     with gr.Row():
-        build_btn = gr.Button("① 掃描 catalogs 並建立索引", scale=3)
-        peek_btn = gr.Button("🔍 檢視 catalogs 內容", scale=1)
-        reload_btn = gr.Button("🔄 重新載入快取", scale=1)
-        clear_btn = gr.Button("🧹 清除快取", scale=1)
-
-    build_status = gr.Markdown("尚未建立")
-    build_btn.click(build_index_from_folder, inputs=[ocr_lang, use_ocr, force_ocr], outputs=[build_status])
-    peek_btn.click(list_catalog_pdfs, outputs=[build_status])
-    reload_btn.click(load_cache, outputs=[build_status])
-    clear_btn.click(clear_cache, outputs=[build_status])
-
-    gr.Markdown("## ② 查詢")
-    with gr.Row():
-        q = gr.Textbox(label="輸入需求（例：『崁燈 12W 3000K CRI90 24度』）", lines=2)
-        topk = gr.Slider(1, 15, value=6, step=1, label="回傳數量 Top-K")
+        q = gr.Textbox(label="輸入需求（例：崁燈 12W 3000K CRI90）", lines=2)
+        topk = gr.Slider(1, 12, value=6, step=1, label="顯示數量 Top-K")
     ask_btn = gr.Button("搜尋")
-    results = gr.Dataframe(headers=["型錄", "頁碼", "相似度/分數", "片段摘要"], wrap=True)
-    ask_btn.click(ask, inputs=[q, topk], outputs=[results])
+    md_out  = gr.Markdown()
+    ask_btn.click(ask, inputs=[q, topk], outputs=[md_out])
 
-    with gr.Accordion("📎 查詢範例", open=False):
-        ex1, ex2, ex3 = sample_queries()
-        gr.Examples(examples=[[ex1], [ex2], [ex3]], inputs=[q], label="點一下填入查詢")
-
-# =========================
-# 入口
-# =========================
 if __name__ == "__main__":
-    # 若你安裝在非預設路徑，可手動指定：
-    # pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-    # os.environ["TESSDATA_PREFIX"] = r"C:\Program Files\Tesseract-OCR\tessdata"
-
-    # 啟動時自動載入快取（若存在）
     if os.path.exists(CACHE_PATH):
         try:
             with open(CACHE_PATH, "rb") as f:
                 INDEX = pickle.load(f)
-            print(f"✅ 已自動載入快取（片段：{len(INDEX.docs)}）。可直接查詢。")
+            print(f"✅ 自動載入快取（{len(INDEX.docs)} 片段）")
         except Exception as e:
             print(f"⚠️ 快取載入失敗：{type(e).__name__}: {e}")
-
     demo.launch()
